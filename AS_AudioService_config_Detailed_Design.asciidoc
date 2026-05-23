@@ -1,0 +1,740 @@
+= SW Detailed Design - AS Audio Service Configuration Module (AS_AudioService_config)
+:sectnums:
+:toc: auto
+:toclevels: 4
+
+== Ownership
+
+BSW Infotainment Audio team
+
+== Purpose
+
+This document describes the detailed design of the AS Audio Service configuration module (`AS_AudioService`) implemented under `hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService`.
+
+The module provides Audio Service runtime behavior for:
+
+* QNX IPC server-side request handling (`name_attach`, `MsgReceive`, `MsgReply`)
+* Audio playback control (create/start/stop/get status)
+* Volume and speaker-channel mute control through CSD2 post-processing
+* Audio recording start/stop handling (when `AUDSER_SOUND_RECORD_ENABLE` is enabled)
+* Event IPC initialization and status-notification response path for clients
+
+This document aligns with:
+
+* Current source implementation in `AS_AudioService` and associated `IAudSerIpc`
+* Build/runtime integration (`common.mk`, CSD2 client, IPC library)
+* Reference document `docs/Audio+Service+Implementation+details.pdf`
+
+== History
+
+See repository history
+
+== General
+
+=== Summary
+
+Main goal of AS_AudioService_config is to provide deterministic, state-driven audio playback/capture control and runtime reconfiguration over IPC and CSD2 for internal amplifier use-cases.
+
+The module abstracts app-type-dependent request handling, CSD2 transport/setup, and playback state transitions (Idle, Start, Starting, Failed). It aligns with platform audio architecture and supports dynamic playback control, volume operations, capture control, and event publishing.
+
+Major responsibilities:
+
+* Service lifecycle init/destroy
+* Audio player instance management for supported app types
+* Playback pipeline setup and data streaming
+* Chime volume/angle and speaker mute management through CSD2 PP control
+* Optional audio capture workflow
+* IPC event channel setup and status event forwarding
+
+=== Limitations on Usage
+
+* Target OS/platform: QNX Neutrino on SA8255.
+* Service endpoint name is fixed to `IAudser_SndIpc`.
+* App-type capacity is compile-time constrained:
+  - Internal amp mode (`AUDSER_INTERNAL_AMP_TYPE`): 2 app types (`enCcsChimeType`, `enIviChimeType`).
+  - External amp mode: 1 app type.
+* Playback channel mapping supports predefined channel counts (1/2/3/4/6/8/16/32).
+* Audio format path is PCM-focused (`audSer_enAudioFormat::enAudioFormatPCM`).
+* CSD2 and dependent libraries must be available (`csd2IpcClient`, `IAudSerIpc`, `slog2`, `bmetrics`).
+* No direct GPIO device access/configuration exists in this module; hardware pin configuration is handled by lower-level audio driver/platform layers.
+
+=== Definitions
+
+|===
+|Term |Definition
+
+|AS Audio Service
+|QNX process `as_audio_service` implementing server-side audio request handling.
+
+|CSD2
+|Audio driver/control interface used for stream/session open, ioctl configuration, read/write, and close.
+
+|IAudSerIpc
+|IPC library/API used by clients and service to exchange audio method requests and events.
+
+|App Type
+|Logical audio client category (`enCcsChimeType`, `enIviChimeType`).
+
+|PP Handle
+|Post-processing control handle for volume/mute parameter operations.
+
+|Graph ID
+|CSD2 graph selector mapped per app type (for internal amp path, IDs 26 and 50 are used).
+|===
+
+=== Abbreviations and Acronyms
+
+|===
+|Abbreviation |Meaning
+
+|AS
+|Audio Service
+
+|IPC
+|Inter-Process Communication
+
+|CSD2
+|Common Sound Driver v2
+
+|PP
+|Post Processing
+
+|GKV
+|Graph Key Vector
+
+|QNX
+|QNX Neutrino RTOS
+
+|SwDD
+|Software Detailed Design
+
+|LLD
+|Low-Level Design
+
+|API
+|Application Programming Interface
+|===
+
+=== Applicable Documents
+
+|===
+|Document Title |Document ID |Version |Notes
+
+|Audio Service Implementation details
+|Audio+Service+Implementation+details.pdf
+|Available in repo
+|Reference architecture/behavior context used for this SwDD
+
+|QNX Neutrino IPC Documentation
+|QNX Docs
+|Platform
+|`name_attach`, `MsgReceive`, pulse handling, `MsgReply`
+
+|CSD2 API Documents
+|Internal
+|Platform
+|Open/ioctl/write/read/close and PP control flows
+|===
+
+=== Referenced Documents
+
+|===
+|Document Title |Document ID |Version |Location
+
+|AS Audio Service Build Configuration
+|common.mk
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/common.mk`
+
+|Audio Service Main Entry
+|main.cpp
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/Adapt/src/main.cpp`
+
+|Audio Service Runtime Loop
+|AudioService_service1.cpp
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/Adapt/src/AudioService_service1.cpp`
+
+|Core Interface
+|AudioService_AudSerInterface.h/.cpp
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/Core`
+
+|Audio Player and Playback
+|AudioService_AudioPlayer.h/.cpp, AudioService_AudioPlayback.h/.cpp
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/Core`
+
+|Volume and Speaker Control
+|AudioService_VolManagement.h/.cpp, AudioService_SpkConfig.h/.cpp
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/AS_AudioService/Core`
+
+|Client IPC Contract
+|IAudSerIpc_AudIpc.h
+|Latest
+|`hlos_qnx_8255/apps/qnx_ap/AMSS/multimedia/audio/audio_ar/stla_audio/AS_AUDIO/IAudSerIpc/inc/IAudSerIpc_AudIpc.h`
+|===
+
+== SW Detailed Design
+
+=== Static View
+
+==== Interfaces of SW Units
+
+The module is split into two major layers:
+
+* Adapt Layer
+  - `main.cpp`: process entry and signal mask setup
+  - `AudioService_service1.*`: QNX IPC server loop and method dispatch
+* Core Layer
+  - `AudioService_AudSerInterface.*`: functional orchestration API
+  - `AudioService_AudioPlayer.*`: app-type player control and thread launch
+  - `AudioService_AudioPlayback.*`: CSD2 stream configuration and write loop
+  - `AudioService_VolManagement.*`: volume and angle control through PP handle
+  - `AudioService_SpkConfig.*`: speaker mute/unmute channel mask control
+  - `AudioService_SoundRecord.*`: optional capture workflow
+  - `AudioService_Csd2Interface.*`: CSD2 wrapper/helper functions
+  - `AudioService_WavExtractor.*`: WAV header parse/write helper
+
+==== Configuration Design Details
+
+|===
+|Item |Configured Value |Source
+
+|Binary Name
+|`as_audio_service`
+|`common.mk` (`NAME=as_audio_service`)
+
+|Usage File
+|`as_audio_service.use`
+|`common.mk` (`USEFILE=$(PROJECT_ROOT)/as_audio_service.use`)
+
+|Service Attach Point
+|`IAudser_SndIpc`
+|`AudioService_service1.h`, `IAudSerIpc_AudIpc.h`
+
+|Primary Libraries
+|`csd2IpcClient`, `IAudSerIpc`, `slog2`, `bmetrics`
+|`common.mk`
+
+|Compile Constraint
+|`-Werror`
+|`common.mk`
+|===
+
+==== Data Structure Design
+
+===== Request Method Enumeration
+
+The service dispatches method IDs from `audSer_enAudioMethod_type` / `IAudSerIpc_enAudioMethod_type`:
+
+|===
+|Method ID |Operation
+
+|`AUDIOCREATEINSTREQ`
+|Create audio player instance metadata
+
+|`AUDIOSTARTPLAYREQ`
+|Start audio playback
+
+|`AUDIOSTOPPLAYREQ`
+|Stop audio playback
+
+|`AUDIOGETSTATUSREQ`
+|Read playback status
+
+|`AUDIOGETVOLLEVELREQ`
+|Read current volume level
+
+|`AUDIOSETVOLLEVELREQ`
+|Set playback volume level
+
+|`AUDIOSTARTCAPTREQ`
+|Start audio capture
+
+|`AUDIOSTOPCAPTREQ`
+|Stop audio capture
+
+|`CLOSECSD2SESSION`
+|Close CSD2 session handle
+
+|`AUDIOEVENTIPCREQ`
+|Initialize event IPC path for status notifications
+|===
+
+===== Core Response Structure
+
+`audioService_strAudPlaybackRes_type` is the primary response/event payload:
+
+* App type (`enAppType`)
+* Request ID (`enReqId`)
+* Response status (`enResStatus`)
+* Iteration count (`u32IterationCount`)
+* Playback status (`enAudStatus`)
+* Volume level (`u32VolLevel`)
+* Event type (`enAudEvents`)
+
+==== API Design
+
+===== Adapt Layer APIs
+
+|===
+|Function |Role
+
+|`AudSer_Service::audioservice_run()`
+|Creates named IPC endpoint and dispatches requests in loop.
+
+|`InitializeSignalHandling()`
+|Configures process signal mask before service start.
+|===
+
+===== Core Interface APIs
+
+|===
+|Function |Role
+
+|`audioService_vAudServiceInit()` / `audioService_vAudServiceDestroy()`
+|Service lifecycle init/deinit.
+
+|`audioService_vAudServiceCreateAudioPlayerInstances(...)`
+|Creates/selects app-type playback instance payload.
+
+|`audioService_vAudServiceStartAudioPlayback(...)`
+|Validates state and triggers playback thread path.
+
+|`audioService_vAudServiceStopAudioPlayback(...)`
+|Stops playback using requested stop mode.
+
+|`audioService_vAudServiceGetAudioPlayerStatus(...)`
+|Returns player state.
+
+|`audioService_vAudServiceSetVolLevel(...)` / `audioService_vAudServiceGetVolLevel(...)`
+|Volume set/get wrappers.
+
+|`audioService_s32InitEventIpc(...)`
+|Initializes client event IPC channel.
+|===
+
+===== Audio Player / Playback APIs
+
+|===
+|Function |Role
+
+|`audioService_u32PreparePlayerData(...)`
+|Initializes mutexes, state payload, graph-id mapping.
+
+|`audioService_u32CreateThreadPlayback(...)`
+|Launches detached playback thread per app type.
+
+|`audioService_vAsStartAudioPlayback(...)`
+|Start request handler; state transition and start trigger.
+
+|`audioService_vAsStopAudioPlayback(...)`
+|Stop request handler.
+
+|`audioService_u32StartAudioPlay(...)`
+|Configures/open/writes playback stream via CSD2.
+
+|`audioService__u32HwEpConfig(...)`
+|Configures hardware endpoint.
+
+|`audioService__u32SwEpConfig(...)`
+|Configures software/buffer endpoint.
+
+|`audioService__u32SetStreamFormat(...)`
+|Sets PCM stream format and channel mapping.
+|===
+
+===== Volume and Speaker Configuration APIs
+
+|===
+|Function |Role
+
+|`audioService_u32SendVolumeToAWE(...)`
+|Sends volume and optional angle values to AWE DSP.
+
+|`audioService_u32GetVolumeFromAWE(...)`
+|Reads current volume setting via PP path.
+
+|`audioService_u32OpenCsd2PPHandle(...)` / `audioService_vCloseCsd2PPHandle()`
+|PP handle lifecycle management.
+
+|`audioService_u32ManageChimeSpkConfig(...)`
+|Builds mute/unmute channel masks and applies through CSD2 PP control.
+|===
+
+==== Static Architecture
+
+[source,text]
+----
++----------------------+      MsgSend/MsgReceive      +---------------------------+
+| Audio Client(s)      | <--------------------------> | AS_AudioService           |
+| via IAudSerIpc       |                              | (name_attach endpoint)    |
++----------------------+                              +-------------+-------------+
+                                                                    |
+                                                                    | Core APIs
+                                                                    v
+                                                        +-----------+------------+
+                                                        | AudSer_AudSerInterface |
+                                                        +-----+------------+-----+
+                                                              |            |
+                                                              |            |
+                                                              v            v
+                                                +-------------+--+   +----+----------------+
+                                                | AudSer_AudioPlayer| | AudSer_SoundRecord |
+                                                +-------------+--+   +---------------------+
+                                                              |
+                                                              v
+                                                     +--------+---------+
+                                                     | AudSer_AudioPlayback |
+                                                     +--------+---------+
+                                                              |
+                                                              v
+                                               +--------------+------------------+
+                                               | CSD2 Interface / Audio Driver   |
+                                               +---------------------------------+
+----
+
+==== GPIO PinMux Configuration
+
+Implementation evidence shows that `AS_AudioService` performs no direct GPIO operations:
+
+* No `/dev/gpio*` access in service/core source.
+* No GPIO register/pinmux APIs called from `AS_AudioService` modules.
+* Hardware routing and pin-level behavior are delegated to audio driver/board configuration layers outside this module.
+
+Therefore, in this module context, GPIO configuration is an external dependency and not an internal design responsibility.
+
+=== Dynamic View
+
+==== Initialization Sequence
+
+1. `main()` invokes `InitializeSignalHandling()`.
+2. `AudSer_Service` object construction calls `audioService_vAudServiceInit()`.
+3. `audioservice_run()` calls `name_attach(NULL, "IAudser_SndIpc", 0)`.
+4. Service enters `while (bexit)` receive loop (`MsgReceive`).
+
+==== Request Handling Sequence
+
+1. Client sends method payload (`audSer_strMetaData_type`) through IPC.
+2. Service receives rcvid and request union.
+3. Service switches on method enum and calls corresponding `AudSer_AudSerInterface` API.
+4. Service returns response via `MsgReply`.
+
+==== State Machine
+
+The runtime player state follows `audSer_enAudioPlayerStatus` transitions:
+
+* `enAudioIdle` -> `enAudioStart` when playback start is accepted.
+* `enAudioStart`/`enAudioStarting` -> `enAudioIdle` when playback completes successfully.
+* `enAudioStart`/`enAudioStarting` -> `enAudioFailed` on playback/CSD2 error.
+* Any connected client disconnect pulse forces stop handling and cleanup for mapped app type.
+
+==== Playback Runtime Sequence
+
+1. `AUDIOSTARTPLAYREQ` arrives with file path, app type, volume, chime angle, iteration count.
+2. Interface validates player state.
+3. Audio player updates payload to `enAudioStart` and launches thread.
+4. Playback thread calls `audioService_u32StartAudioPlay(...)`.
+5. Playback configures CSD2 session and stream format.
+6. WAV data is written in chunks through CSD2 write loop.
+7. On completion/failure, status is updated and PP handle is closed.
+
+==== Disconnect and Cleanup Behavior
+
+When `_PULSE_CODE_DISCONNECT` is received:
+
+1. Service finds mapped app type for disconnected client.
+2. Service triggers regular stop mode.
+3. Event IPC channel for app is deinitialized.
+4. Service clears mapping and detaches connection (`ConnectDetach`).
+
+==== Event Notification Path
+
+1. Client requests `AUDIOEVENTIPCREQ`.
+2. Service initializes event IPC via `audioService_s32InitEventIpc(...)`.
+3. Client side `IAudSerIpc` receives event payloads.
+4. `enAudioOnStatusEvent` response content is forwarded to client callback/reply path.
+
+=== Detailed Level Design
+
+==== Interoperability
+
+* Service loop is single dispatch loop; playback work is offloaded to detached threads per app type.
+* Mutexes are used in player and volume/speaker modules for state/PP handle protection.
+* Stop mode (`quick`/`regular`) is tracked in player state.
+* App occupancy and iteration counts are maintained in player payload.
+
+==== API Function Signatures
+
+Representative public interface signatures:
+
+* `void audioService_vAudServiceCreateAudioPlayerInstances(audioService_strCreateAudPlayerApp_type const k_strData)`
+* `void audioService_vAudServiceStartAudioPlayback(audioService_strStartPlaybackParams_type const& k_strData)`
+* `void audioService_vAudServiceStopAudioPlayback(audioService_strStopAudPlayerParams_type const k_strData)`
+* `void audioService_vAudServiceGetAudioPlayerStatus(audSer_enApp_type const k_enAppType)`
+* `void audioService_vAudServiceSetVolLevel(audioService_strAudSetVolLevel_type const k_strData)`
+* `void audioService_vAudServiceGetVolLevel(audSer_enApp_type& enAppType)`
+
+==== Audio Service API Behavior (Implementation Details)
+
+The following API behavior is aligned to the Audio Service implementation details reference and mapped to the current module design.
+
+===== Main API Set Used by Test Application
+
+|===
+|# |Reference API |Current Service Mapping |Behavior Summary
+
+|1
+|`onCreateWavPlayerInstance(const CreateWavPlayerInstParam&)`
+|`audioService_vAudServiceCreateAudioPlayerInstances(...)`
+|Creates/assigns app-type player instance and returns response payload.
+
+|2
+|`onStartPlaybackWavFile(const WavPlayStartPbParam&)`
+|`audioService_vAudServiceStartAudioPlayback(...)`
+|Starts non-blocking playback workflow and publishes start response/event.
+
+|3
+|`onStopPlaybackWavfile(const WavPlayStopPbParam&)`
+|`audioService_vAudServiceStopAudioPlayback(...)`
+|Stops playback using requested stop type and returns stop response/event.
+
+|4
+|`onGetWavPlayerStatus(app_type_value appID)`
+|`audioService_vAudServiceGetAudioPlayerStatus(...)`
+|Returns player status for the requested app type.
+
+|5
+|`onStartCaptureWavFile(const AudioStartCaptureParams&)`
+|`audioService_vAudServiceStartSoundRecord(...)`
+|Starts capture path; capture runs asynchronously with parameter checks.
+
+|6
+|`onStopCaptureWavfile(const AudioStopCaptureParams&)`
+|`audioService_vAudServiceStopSoundRecord(...)`
+|Stops capture path based on stop notification flag.
+
+|7
+|`SetVolumeLevel(const WavPlaySetVolumeParam&)`
+|`audioService_vAudServiceSetVolLevel(...)`
+|Sets per-app playback volume and publishes set-volume response/event.
+
+|8
+|`GetVolumeLevel(app_type_value appID)`
+|`audioService_vAudServiceGetVolLevel(...)`
+|Reads per-app volume and publishes get-volume response/event.
+
+|9
+|`publishEvent(WavPlayback_events, const WavPlayResponseMsg&)`
+|Event IPC path (`AUDIOEVENTIPCREQ`, `enAudioOnStatusEvent`)
+|Sends response/status payloads to client over event channel.
+|===
+
+===== App Type Enumeration (Internal Amplifier Scope)
+
+Reference enum and current design intent are aligned:
+
+* `INVALID_CHIME_TYPE = 0`
+* `CCS_CHIME_TYPE`
+* `IVI_CHIME_TYPE`
+* `HIGH_CHIME_TYPE`
+
+In current implementation, internal amplifier mode is considered and active app types are mapped to service instances/graph IDs.
+
+===== Initialization and Lifetime Behavior
+
+* `onInitialize()`/`onDestroy()` are expected to be called once per server lifecycle (not per client application).
+* Initialization flow includes create-instance preparation from service startup path.
+* In internal-amp mode, two logical instances are supported:
+  - Instance-1: Graph ID 26
+  - Instance-2: Graph ID 50
+* Allocation behavior is effectively first-available/first-served from service perspective.
+
+===== Request/Response Message Pattern
+
+All major playback control APIs use a common response payload concept (`WavPlayResponseMsg` in reference notes), represented in current module by `audioService_strAudPlaybackRes_type`.
+
+Response fields conceptually include:
+
+* app type
+* request identifier
+* response status
+* repetition/iteration count
+* playback status
+* volume level
+
+===== API-specific Behavior Notes
+
+* Create instance must be completed before start playback for a given app type.
+* During ongoing playback, client is expected to be able to call:
+  - Set volume
+  - Get volume
+  - Stop playback
+  - Get status
+* Start capture is non-blocking and stop capture can be called at any time.
+* Capture start validates input parameters, updates graph/device descriptors, and sets capture event registration path.
+
+===== Event Publishing Semantics
+
+Reference event outputs are aligned to response categories:
+
+* Create response
+* Start playback response
+* Stop playback response
+* Get status response
+* Set volume response
+* Get volume response
+* Status event notification
+
+Current design uses event IPC registration (`AUDIOEVENTIPCREQ`) and status event forwarding (`enAudioOnStatusEvent`) for this purpose.
+
+===== Scope Notes from Implementation Details
+
+* Internal amplifier use-case is the considered scope.
+* InterVM behavior is not considered.
+* Public event transport details from server to client remain a design decision item.
+
+==== State Machine Design
+
+For internal amp mode, graph mapping is explicitly assigned in player preparation:
+
+* App type 1 (`enCcsChimeType`) -> Graph ID 26
+* App type 2 (`enIviChimeType`) -> Graph ID 50
+
+This mapping is used by playback and PP control data paths.
+
+==== Volume, Angle, and Mute Handling
+
+* Volume API tracks logical levels (Low/Mid/High).
+* AWE path supports combined update: volume and chime angle.
+* Speaker channel mute/unmute is encoded into bitmasks and sent via PP control.
+* PP handle is closed on both success and failure paths to avoid stale handle leakage.
+
+==== Recording Path
+
+When recording is enabled by compile macro:
+
+* Start/stop capture methods are accepted over IPC.
+* Capture graph and callback path are configured in `AudioService_SoundRecord`.
+* WAV header and file handling use `AudSer_WavExtractor` helper.
+
+==== Error Handling
+
+* QNX IPC failures (`MsgReceive`, `MsgReply`, `ConnectDetach`) are logged.
+* CSD2 operation return values are checked and propagated.
+* Null checks and allocation checks are present before processing.
+* Build includes `slog2` and `bmetrics`; source includes detailed runtime `cout` diagnostics.
+
+==== Criticality Analysis
+
+* Service availability is critical for chime playback and event reporting.
+* IPC loop robustness and deterministic cleanup on client disconnect are key runtime priorities.
+* Failure impact is limited to audio service behavior and does not include direct GPIO or low-level pin control.
+
+==== Complexity Analysis
+
+* Moderate control-flow complexity due to IPC dispatch, multi-request handling, and threaded playback path.
+* Data complexity is moderate and largely bounded by fixed payload types and enums.
+* Integration complexity is medium-to-high because behavior depends on CSD2 driver stack and client IPC contract.
+
+==== Testability
+
+* Unit-level testability exists for enum/state handling and payload preparation.
+* Integration testing is required for IPC request/response and CSD2 stream operations.
+* Fault-injection test scenarios should include CSD2 failures, invalid app type, and disconnect pulses.
+
+==== Risk Assessment
+
+* Risk: malformed payload combinations from client.
+  - Mitigation: enum/status validation and fail responses.
+* Risk: stale PP/session handles across abnormal stop paths.
+  - Mitigation: explicit close calls on success and failure paths.
+* Risk: dependency failure in CSD2 or IPC attachment.
+  - Mitigation: return-code checks, logging, and controlled service exit.
+
+=== Restrictions and Constraints
+
+* Service name and IPC contract are fixed by `IAudSerIpc` method definitions.
+* Supported app types and graph mappings are compile-time constrained by amp mode.
+* PCM playback path assumptions apply to current implementation.
+* This module does not configure GPIO and relies on lower-layer platform/audio-driver setup.
+
+=== Diagnosis and Logging
+
+* Runtime logs are emitted on IPC receive/reply failures and disconnect handling.
+* CSD2 return values are logged on configuration and stream operations.
+* Build links `slog2` and `bmetrics` to support diagnostics/performance instrumentation.
+
+=== Safety Assessment
+
+* Service behavior is bounded to fixed IPC methods and typed payload unions.
+* No direct privileged GPIO/pinmux writes are performed in this module.
+* Residual safety risk remains around invalid client parameters and dependency faults.
+
+=== Security Assessment
+
+* Service is process-isolated and does not execute arbitrary code paths from IPC payloads beyond fixed method switch.
+* Signal mask setup blocks most signals to reduce asynchronous interruptions.
+* Interface uses fixed-size payload structures; callers must supply valid enumerations/parameters.
+* No direct GPIO or privileged register writes are performed by this module.
+* Residual risk: malformed client payload values can still request invalid combinations; robustness relies on downstream validation and response status handling.
+
+== Traceability
+
+|===
+|Software Requirement IDs |Software Architecture ID (component name) |Software Detailed Design ID (unit name) |Function IDs
+
+| | | |audioService_vAudServiceCreateAudioPlayerInstances (create player instance)
+| | | |audioService_vAudServiceStartAudioPlayback (start playback request)
+| | | |audioService_vAudServiceStopAudioPlayback (stop playback request)
+| | | |audioService_vAudServiceGetAudioPlayerStatus (get playback status)
+| | | |audioService_vAudServiceSetVolLevel (set volume level)
+| | | |audioService_vAudServiceGetVolLevel (get volume level)
+| | | |audioService_vAudServiceStartSoundRecord (start capture)
+| | | |audioService_vAudServiceStopSoundRecord (stop capture)
+| | | |audioService_s32InitEventIpc (event IPC registration)
+|===
+
+== Open Topics
+
+* Requirement IDs and upstream RTM links should be added when official requirement baseline is provided.
+* If image assets from `Audio+Service+Implementation+details.pdf` are extracted into repo, architecture sequence figures can be embedded in this SwDD.
+* Stress/performance targets (max concurrent requests, latency budget, CPU/memory thresholds) should be formalized for production acceptance.
+* Public event usage/transport contract (exact client delivery mechanism for publish-event semantics) is pending final middleware decision.
+* InterVM handling is currently out of scope and requires explicit architectural decision before inclusion.
+
+== Appendix
+
+=== Source File Index
+
+* `Adapt/src/main.cpp`
+* `Adapt/src/AudioService_service1.cpp`
+* `Core/inc/AudioService_AudSerInterface.h`
+* `Core/src/AudioService_AudSerInterface.cpp`
+* `Core/inc/AudioService_AudioPlayer.h`
+* `Core/src/AudioService_AudioPlayer.cpp`
+* `Core/inc/AudioService_AudioPlayback.h`
+* `Core/src/AudioService_AudioPlayback.cpp`
+* `Core/inc/AudioService_VolManagement.h`
+* `Core/inc/AudioService_SpkConfig.h`
+* `Core/inc/AudioService_SoundRecord.h`
+* `../IAudSerIpc/inc/IAudSerIpc_AudIpc.h`
+
+=== References
+
+* `docs/Audio+Service+Implementation+details.pdf`
+* `AS_AudioService/common.mk`
+* `AS_AudioService/Adapt/src/main.cpp`
+* `AS_AudioService/Adapt/src/AudioService_service1.cpp`
+* `AS_AudioService/Core/inc/AudioService_AudSerInterface.h`
+* `AS_AudioService/Core/src/AudioService_AudioPlayer.cpp`
+
+=== Build/Integration Notes
+
+* Build descriptor: `AS_AudioService/common.mk`
+* Runtime binary: `as_audio_service`
+* Attach point: `IAudser_SndIpc`
+* Dependencies: `csd2IpcClient`, `IAudSerIpc`, `slog2`, `bmetrics`
